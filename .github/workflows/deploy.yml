@@ -7,6 +7,12 @@ on:
     branches:
       - main
 
+env:
+  # 提前启用 Node 24 模式，消除 GitHub Actions 的弃用警告
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -16,65 +22,56 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '21'
+          # 必须设为 22 或更高，以满足最新版 Wrangler 的强制要求
+          node-version: '22'
       
       - name: Install dependencies
         run: npm install
       
-      - name: Install wrangler
-        run: npm install -g wrangler
-      
       - name: Check and Create KV Namespace
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
         run: |
           KV_NAMESPACE="SUBLINK_KV"
           echo "Checking for KV namespace: $KV_NAMESPACE"
-          if ! LIST_OUTPUT=$(wrangler kv namespace list 2>&1); then
+          
+          # 使用 npx 确保调用正确版本的 wrangler，避免全局安装冲突
+          if ! LIST_OUTPUT=$(npx wrangler kv namespace list 2>&1); then
             echo "Error getting KV namespace list: $LIST_OUTPUT"
             exit 1
           fi
           
-          LIST_OUTPUT=$(echo "$LIST_OUTPUT" | grep -v "Cloudflare collects" | grep -v "telemetry")
-          echo "Cleaned KV namespace list output: $LIST_OUTPUT"
+          # 过滤掉杂讯，仅保留 JSON 部分
+          CLEAN_JSON=$(echo "$LIST_OUTPUT" | grep -v "Cloudflare collects" | grep -v "telemetry")
           
-          if ! echo "$LIST_OUTPUT" | jq empty; then
+          if ! echo "$CLEAN_JSON" | jq empty; then
             echo "Invalid JSON output from wrangler"
             exit 1
           fi
           
-          KV_ID=$(echo "$LIST_OUTPUT" | jq -r '.[] | select(.title == "sublink-worker-'$KV_NAMESPACE'") | .id')
+          KV_ID=$(echo "$CLEAN_JSON" | jq -r '.[] | select(.title == "sublink-worker-'$KV_NAMESPACE'") | .id')
           
           if [ -z "$KV_ID" ]; then
               echo "KV namespace $KV_NAMESPACE does not exist. Creating..."
-              CREATE_OUTPUT=$(wrangler kv namespace create "sublink-worker-$KV_NAMESPACE" 2>&1)
-              echo "Create KV namespace output: $CREATE_OUTPUT"
-              KV_ID=$(echo "$CREATE_OUTPUT" | grep -o '[0-9a-f]\{32\}')
+              CREATE_OUTPUT=$(npx wrangler kv namespace create "sublink-worker-$KV_NAMESPACE" 2>&1)
+              # 提取 ID 并确保只取第一个结果
+              KV_ID=$(echo "$CREATE_OUTPUT" | grep -o '[0-9a-f]\{32\}' | head -n 1)
               
               if [ -z "$KV_ID" ]; then
                   echo "Failed to extract KV ID. Full output: $CREATE_OUTPUT"
                   exit 1
               fi
-              
-              echo "KV namespace $KV_NAMESPACE created successfully with ID: $KV_ID"
+              echo "Created new KV ID: $KV_ID"
           else
-              echo "KV namespace $KV_NAMESPACE already exists with ID: $KV_ID"
+              echo "Found existing KV ID: $KV_ID"
           fi
+          
+          # 写入环境变量供后续步骤使用
           echo "KV_ID=$KV_ID" >> $GITHUB_ENV
           
       - name: Update wrangler.toml
         run: |
-          # Read the entire content of wrangler.toml
-          WRANGLER_CONTENT=$(cat wrangler.toml)
-          
-          # Update the KV namespace ID
-          UPDATED_CONTENT=$(echo "$WRANGLER_CONTENT" | sed 's/id = "[^"]*"/id = "'$KV_ID'"/')
-          
-          # Write the updated content back to wrangler.toml
-          echo "$UPDATED_CONTENT" > wrangler.toml
-          
-          echo "Updated wrangler.toml content:"
+          # 直接使用 sed 修改文件内容
+          sed -i 's/id = "[^"]*"/id = "'$KV_ID'"/' wrangler.toml
+          echo "Updated wrangler.toml:"
           cat wrangler.toml
           
       - name: Deploy to Cloudflare Workers
